@@ -12,11 +12,15 @@ import {
   Sparkles,
   HelpCircle,
   Bug,
+  Music,
   Download,
   CheckCircle2,
   Check,
   AlertTriangle,
   Play,
+  Pause,
+  SkipForward,
+  SkipBack,
   RotateCw,
   PlusCircle,
   Lock,
@@ -64,10 +68,33 @@ import {
   getDocs,
   GoogleAuthProvider,
   signInWithPopup,
+  signInAnonymously,
   onSnapshot
 } from "./firebase";
 import ShaderCanvas from "./components/ShaderCanvas";
 
+
+
+
+
+// Helper functions for Spotify PKCE (Proof Key for Code Exchange)
+async function generateCodeChallenge(codeVerifier: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(codeVerifier);
+  const digest = await window.crypto.subtle.digest("SHA-256", data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function generateCodeVerifier(length: number = 64): string {
+  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const values = window.crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(values)
+    .map((x) => possible[x % possible.length])
+    .join("");
+}
 
 // Translations mapping
 const t = {
@@ -603,6 +630,353 @@ export default function App() {
   const [legalDescription, setLegalDescription] = useState("");
   const [showCheckResponseModal, setShowCheckResponseModal] = useState(false);
   const [showOmniModal, setShowOmniModal] = useState(false);
+  const [showSpotifyModal, setShowSpotifyModal] = useState(false);
+  const [spotifyInputUrl, setSpotifyInputUrl] = useState("");
+  const [spotifyCurrentUrl, setSpotifyCurrentUrl] = useState("https://open.spotify.com/embed/playlist/37i9dQZF1DX8Ueb7mPSg86?utm_source=generator&theme=0");
+
+  // New Spotify Integration & Login States
+  const [spotifyToken, setSpotifyToken] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("spotify_user_token") || "";
+    }
+    return "";
+  });
+  const [spotifyClientId, setSpotifyClientId] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("spotify_client_id") || "49e610bef2d048b49c15bb45d54b4d26";
+    }
+    return "49e610bef2d048b49c15bb45d54b4d26";
+  });
+  const [spotifyProfile, setSpotifyProfile] = useState<any>(null);
+  const [spotifyTopTracks, setSpotifyTopTracks] = useState<any[]>([]);
+  const [spotifyCurrentlyPlaying, setSpotifyCurrentlyPlaying] = useState<any>(null);
+  const [spotifyIsLoading, setSpotifyIsLoading] = useState<boolean>(false);
+  const [spotifyError, setSpotifyError] = useState<string>("");
+  const [spotifyAuthTab, setSpotifyAuthTab] = useState<"token" | "oauth">("token");
+
+  // New Spotify Ball, Search, and Remote Player Control States
+  const [isSpotifyBallOpen, setIsSpotifyBallOpen] = useState(false);
+  const [spotifySearchQuery, setSpotifySearchQuery] = useState("");
+  const [spotifySearchResults, setSpotifySearchResults] = useState<any[]>([]);
+  const [spotifyIsSearching, setSpotifyIsSearching] = useState(false);
+
+  // Poll Spotify player state frequently if ball is open and token exists
+  useEffect(() => {
+    if (!spotifyToken || !isSpotifyBallOpen) return;
+    
+    const fetchCurrent = async () => {
+      try {
+        const playingRes = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+          headers: { Authorization: `Bearer ${spotifyToken}` }
+        });
+        if (playingRes.status === 401) {
+          setSpotifyToken("");
+          localStorage.removeItem("spotify_user_token");
+          return;
+        }
+        if (playingRes.ok && playingRes.status !== 204) {
+          const playingData = await playingRes.json();
+          setSpotifyCurrentlyPlaying(playingData);
+        } else {
+          setSpotifyCurrentlyPlaying(null);
+        }
+      } catch (err) {
+        console.warn("Error polling player state", err);
+      }
+    };
+
+    fetchCurrent();
+    const interval = setInterval(fetchCurrent, 4000); // 4 seconds poll for highly responsive floating ball
+    return () => clearInterval(interval);
+  }, [spotifyToken, isSpotifyBallOpen]);
+
+  // Handle Remote Controls (Play, Pause, Next, Previous)
+  const handleSpotifyControl = async (action: "play" | "pause" | "next" | "previous" | "play_track", trackUri?: string) => {
+    if (!spotifyToken) {
+      showToast("Por favor, conecte com o Spotify Oficial.", "warning");
+      return;
+    }
+
+    let url = "https://api.spotify.com/v1/me/player";
+    let method = "PUT";
+    let body: any = null;
+
+    if (action === "play") {
+      url += "/play";
+    } else if (action === "pause") {
+      url += "/pause";
+    } else if (action === "next") {
+      url += "/next";
+      method = "POST";
+    } else if (action === "previous") {
+      url += "/previous";
+      method = "POST";
+    } else if (action === "play_track") {
+      url += "/play";
+      body = JSON.stringify({ uris: [trackUri] });
+    }
+
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${spotifyToken}`,
+          "Content-Type": "application/json"
+        },
+        body
+      });
+
+      if (res.status === 204 || res.status === 200) {
+        showToast(
+          action === "play" || action === "play_track" ? "Reproduzindo no Spotify!" :
+          action === "pause" ? "Pausado." :
+          action === "next" ? "Próxima música." : "Música anterior.",
+          "success"
+        );
+        // poll immediately
+        setTimeout(async () => {
+          const playingRes = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+            headers: { Authorization: `Bearer ${spotifyToken}` }
+          });
+          if (playingRes.ok && playingRes.status !== 204) {
+            const data = await playingRes.json();
+            setSpotifyCurrentlyPlaying(data);
+          }
+        }, 1000);
+      } else {
+        // Fallback to embed player for play_track if they don't have premium/active device
+        if (action === "play_track" && trackUri) {
+          const parts = trackUri.split(":");
+          if (parts.length === 3) {
+            setSpotifyCurrentUrl(`https://open.spotify.com/embed/${parts[1]}/${parts[2]}?utm_source=generator&theme=0`);
+            showToast("Iniciando no player embutido!", "info");
+          }
+        } else {
+          showToast("Nenhum player ativo detectado. Abra o Spotify no seu celular/PC!", "info");
+        }
+      }
+    } catch (err) {
+      console.error("Control failed", err);
+      if (action === "play_track" && trackUri) {
+        const parts = trackUri.split(":");
+        if (parts.length === 3) {
+          setSpotifyCurrentUrl(`https://open.spotify.com/embed/${parts[1]}/${parts[2]}?utm_source=generator&theme=0`);
+          showToast("Iniciando no player embutido!", "info");
+        }
+      }
+    }
+  };
+
+  // Handle Search API
+  const handleSpotifySearch = async (query: string) => {
+    if (!query.trim()) {
+      setSpotifySearchResults([]);
+      return;
+    }
+    if (!spotifyToken) {
+      showToast("Conecte ao Spotify para pesquisar.", "warning");
+      return;
+    }
+
+    setSpotifyIsSearching(true);
+    try {
+      const res = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track,playlist&limit=8`, {
+        headers: { Authorization: `Bearer ${spotifyToken}` }
+      });
+      if (res.status === 401) {
+        setSpotifyToken("");
+        localStorage.removeItem("spotify_user_token");
+        showToast("Sessão expirada. Reconecte o Spotify.", "warning");
+        return;
+      }
+      if (res.ok) {
+        const data = await res.json();
+        setSpotifySearchResults(data.tracks?.items || []);
+      }
+    } catch (err) {
+      console.error("Search error", err);
+    } finally {
+      setSpotifyIsSearching(false);
+    }
+  };
+
+  // Handle Hash/Code Token Extraction and Popup communication
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get("code");
+
+    if (code) {
+      const codeVerifier = localStorage.getItem("spotify_code_verifier") || "";
+      const clientId = localStorage.getItem("spotify_client_id") || "49e610bef2d048b49c15bb45d54b4d26";
+      
+      const tradeCodeForToken = async () => {
+        try {
+          const res = await fetch("https://accounts.spotify.com/api/token", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              client_id: clientId,
+              grant_type: "authorization_code",
+              code: code,
+              redirect_uri: window.location.origin + "/",
+              code_verifier: codeVerifier,
+            }),
+          });
+          
+          if (res.ok) {
+            const data = await res.json();
+            const token = data.access_token;
+            if (token) {
+              setSpotifyToken(token);
+              localStorage.setItem("spotify_user_token", token);
+              
+              // Clear the code and params from URL
+              window.history.replaceState(null, "", window.location.pathname);
+
+              if (window.opener) {
+                window.opener.postMessage({ type: "SPOTIFY_TOKEN", token }, "*");
+                window.close();
+              }
+            }
+          } else {
+            console.error("Token trade failed", await res.text());
+          }
+        } catch (err) {
+          console.error("Token trade fetch error", err);
+        }
+      };
+      
+      tradeCodeForToken();
+    }
+
+    const hash = window.location.hash;
+    if (hash.includes("access_token=")) {
+      const params = new URLSearchParams(hash.substring(1));
+      const token = params.get("access_token");
+      if (token) {
+        setSpotifyToken(token);
+        localStorage.setItem("spotify_user_token", token);
+        // Clear the hash from the URL
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        
+        if (window.opener) {
+          window.opener.postMessage({ type: "SPOTIFY_TOKEN", token }, "*");
+          window.close();
+        }
+      }
+    }
+  }, []);
+
+  // Listen to message from OAuth popup
+  useEffect(() => {
+    const handleSpotifyMessage = (event: MessageEvent) => {
+      if (event.data?.type === "SPOTIFY_TOKEN") {
+        const token = event.data.token;
+        if (token) {
+          setSpotifyToken(token);
+          localStorage.setItem("spotify_user_token", token);
+          showToast("Autenticado com o Spotify com sucesso!", "success");
+        }
+      }
+    };
+
+    window.addEventListener("message", handleSpotifyMessage);
+    return () => window.removeEventListener("message", handleSpotifyMessage);
+  }, []);
+
+  // Fetch Spotify User Profile, Top Tracks, and Currently Playing Track
+  useEffect(() => {
+    if (!spotifyToken) {
+      setSpotifyProfile(null);
+      setSpotifyTopTracks([]);
+      setSpotifyCurrentlyPlaying(null);
+      return;
+    }
+
+    const fetchSpotifyData = async () => {
+      setSpotifyIsLoading(true);
+      setSpotifyError("");
+      try {
+        // Fetch Profile
+        const profileRes = await fetch("https://api.spotify.com/v1/me", {
+          headers: { Authorization: `Bearer ${spotifyToken}` }
+        });
+        
+        if (profileRes.status === 401) {
+          throw new Error("UNAUTHORIZED");
+        }
+        
+        if (!profileRes.ok) {
+          throw new Error(`Failed to fetch profile: ${profileRes.status}`);
+        }
+        
+        const profileData = await profileRes.json();
+        setSpotifyProfile(profileData);
+
+        // Fetch Top Tracks (limit 5)
+        const tracksRes = await fetch("https://api.spotify.com/v1/me/top/tracks?time_range=medium_term&limit=5", {
+          headers: { Authorization: `Bearer ${spotifyToken}` }
+        });
+        if (tracksRes.ok) {
+          const tracksData = await tracksRes.json();
+          setSpotifyTopTracks(tracksData.items || []);
+        }
+
+        // Fetch Currently Playing Track
+        const playingRes = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+          headers: { Authorization: `Bearer ${spotifyToken}` }
+        });
+        if (playingRes.ok && playingRes.status !== 204) {
+          const playingData = await playingRes.json();
+          setSpotifyCurrentlyPlaying(playingData);
+        }
+      } catch (err: any) {
+        console.error("Spotify API error:", err);
+        if (err.message === "UNAUTHORIZED") {
+          setSpotifyError("Token expirado ou inválido. Por favor, faça login novamente.");
+          setSpotifyToken("");
+          localStorage.removeItem("spotify_user_token");
+        } else {
+          setSpotifyError("Erro de comunicação com o Spotify. Verifique seu token/conexão.");
+        }
+      } finally {
+        setSpotifyIsLoading(false);
+      }
+    };
+
+    fetchSpotifyData();
+
+    // Set up polling for currently playing track (every 15 seconds)
+    const interval = setInterval(() => {
+      if (spotifyToken) {
+        fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+          headers: { Authorization: `Bearer ${spotifyToken}` }
+        })
+        .then(res => {
+          if (res.status === 401) {
+            setSpotifyToken("");
+            localStorage.removeItem("spotify_user_token");
+            return null;
+          }
+          return res.status === 204 ? null : res.json();
+        })
+        .then(data => {
+          if (data) {
+            setSpotifyCurrentlyPlaying(data);
+          } else {
+            setSpotifyCurrentlyPlaying(null);
+          }
+        })
+        .catch(err => console.warn("Polling currently playing failed", err));
+      }
+    }, 15000);
+
+    return () => clearInterval(interval);
+  }, [spotifyToken]);
   const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number; accuracy: number; timestamp: number } | null>(null);
 
   // Request user location on component mount or auth load
@@ -1083,8 +1457,49 @@ export default function App() {
 
   // Firebase Auth State listener & Firestore synchronisation
   useEffect(() => {
+    // Check if there is an active local guest session
+    const savedGuest = localStorage.getItem("hackerfy_guest_user");
+    if (savedGuest) {
+      try {
+        const guestUserObj = JSON.parse(savedGuest);
+        setCurrentUser(guestUserObj);
+        
+        // INSTANT CACHE LOAD
+        const savedProfile = localStorage.getItem("hackerfy_profile");
+        const savedOnboarded = localStorage.getItem("hackerfy_onboarded") === "true";
+        const savedConversations = localStorage.getItem("hackerfy_conversations");
+        const savedActiveId = localStorage.getItem("hackerfy_active_chat_id");
+        
+        if (savedProfile) {
+          try {
+            setUserProfile(JSON.parse(savedProfile));
+          } catch (e) {}
+        }
+        setIsOnboarded(savedOnboarded);
+        if (savedConversations) {
+          try {
+            const parsed = JSON.parse(savedConversations);
+            setConversations(parsed);
+            if (savedActiveId) {
+              setActiveChatId(savedActiveId);
+              const found = parsed.find((c: any) => c.id === savedActiveId);
+              if (found) {
+                setMessages(found.messages);
+              }
+            }
+          } catch (e) {}
+        }
+        setAuthLoading(false);
+        setIsInitialSyncing(false);
+      } catch (e) {
+        console.error("Erro ao restaurar sessão de visitante:", e);
+      }
+    }
+
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
+        // If logged in via standard firebase, clear any legacy guest session to avoid confusion
+        localStorage.removeItem("hackerfy_guest_user");
         setCurrentUser(user);
         
         // INSTANT CACHE LOAD: load local storage data instantly first so the app is instantly visible and interactive
@@ -1179,9 +1594,15 @@ export default function App() {
         })();
 
       } else {
-        setCurrentUser(null);
-        setIsInitialSyncing(true);
-        setAuthLoading(false);
+        // Only reset currentUser if there's no active guest session
+        if (!localStorage.getItem("hackerfy_guest_user")) {
+          setCurrentUser(null);
+          setIsInitialSyncing(true);
+          setAuthLoading(false);
+        } else {
+          setAuthLoading(false);
+          setIsInitialSyncing(false);
+        }
       }
     });
 
@@ -1191,6 +1612,10 @@ export default function App() {
   // Sync state changes to Firestore
   useEffect(() => {
     if (currentUser && !isInitialSyncing && !authLoading) {
+      // Don't try syncing if we are on a guest/local anonymous user session
+      if (currentUser.uid?.startsWith("guest_") || currentUser.isAnonymous) {
+        return;
+      }
       const syncData = async () => {
         try {
           const userDocRef = doc(db, "users", currentUser.uid);
@@ -1878,6 +2303,52 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
     }
   };
 
+  const handleAnonymousSignIn = async () => {
+    setAuthPending(true);
+    setAuthError("");
+    setAuthSuccessMsg("");
+    try {
+      // Direct local guest login to instantly skip the auth screen as requested by the user
+      const mockGuestUser = {
+        uid: "guest_" + Math.random().toString(36).substring(2, 11),
+        isAnonymous: true,
+        displayName: "Visitante Anônimo",
+        email: "guest@hackerfy.local"
+      };
+
+      // Save to localStorage so that it is persistent across page reloads
+      localStorage.setItem("hackerfy_guest_user", JSON.stringify(mockGuestUser));
+
+      // Build default profile if not present
+      const savedProfile = localStorage.getItem("hackerfy_profile");
+      if (!savedProfile) {
+        const guestProfile = {
+          name: "Visitante Anônimo",
+          age: "N/A",
+          profileType: "individual" as const,
+          howToCall: "Visitante",
+          goal: "Auditoria e Testes de Cibersegurança"
+        };
+        setUserProfile(guestProfile);
+        setIsOnboarded(true);
+        localStorage.setItem("hackerfy_profile", JSON.stringify(guestProfile));
+        localStorage.setItem("hackerfy_onboarded", "true");
+      }
+
+      setAuthSuccessMsg("Entrando de forma segura como Visitante Anônimo...");
+
+      // Smooth transition to the terminal interface
+      setTimeout(() => {
+        setCurrentUser(mockGuestUser);
+        setAuthPending(false);
+      }, 300);
+    } catch (err: any) {
+      console.error(err);
+      setAuthError("Erro ao iniciar sessão de visitante local.");
+      setAuthPending(false);
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!authEmail || !authPassword) {
@@ -1918,7 +2389,7 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
         errStr.includes("wrong-password") ||
         errStr.includes("invalid-credential")
       ) {
-        errorMsg = "E-mail ou senha incorretos.";
+        errorMsg = "E-mail ou senha incorretos. Nota importante: O preview do AI Studio utiliza um projeto Firebase isolado da sua produção na Vercel! Se você criou sua conta na Vercel, você precisará clicar na aba 'Registrar' aqui para criar uma conta nova neste preview, ou configurar as variáveis de ambiente VITE_FIREBASE_... correspondentes no menu do AI Studio.";
       } else if (err.code === "auth/invalid-email" || errStr.includes("invalid-email")) {
         errorMsg = "Formato de e-mail inválido.";
       } else if (err.code === "auth/too-many-requests" || errStr.includes("too-many-requests")) {
@@ -2059,6 +2530,7 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
       localStorage.removeItem("hackerfy_profile");
       localStorage.removeItem("hackerfy_conversations");
       localStorage.removeItem("hackerfy_active_chat_id");
+      localStorage.removeItem("hackerfy_guest_user");
     } catch (err) {
       console.error("Erro ao deslogar:", err);
     }
@@ -2297,6 +2769,17 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
                 <span>Entrar com o Google</span>
               </button>
 
+              <button
+                id="anonymous-register-btn"
+                type="button"
+                disabled={authPending}
+                onClick={handleAnonymousSignIn}
+                className="w-full mt-2 flex items-center justify-center gap-2 bg-stone-900 hover:bg-stone-850 text-white border border-white/10 hover:border-white/20 font-sans font-medium py-2 rounded-lg transition-all shadow-[0_1px_3px_rgba(0,0,0,0.1)] hover:shadow-[0_4px_10px_rgba(0,0,0,0.15)] text-xs disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+              >
+                <User className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                <span className="text-stone-200">Acessar como Visitante Anônimo</span>
+              </button>
+
               <div className="text-center pt-3 border-t border-white/5 mt-4">
                 <p className="text-[11px] text-stone-400">
                   Já possui uma conta?{" "}
@@ -2430,6 +2913,17 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
                   />
                 </svg>
                 <span>Entrar com o Google</span>
+              </button>
+
+              <button
+                id="anonymous-login-btn"
+                type="button"
+                disabled={authPending}
+                onClick={handleAnonymousSignIn}
+                className="w-full mt-2 flex items-center justify-center gap-2 bg-stone-900 hover:bg-stone-850 text-white border border-white/10 hover:border-white/20 font-sans font-medium py-2 rounded-lg transition-all shadow-[0_1px_3px_rgba(0,0,0,0.1)] hover:shadow-[0_4px_10px_rgba(0,0,0,0.15)] text-xs disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+              >
+                <User className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                <span className="text-stone-200">Acessar como Visitante Anônimo</span>
               </button>
 
               <div className="text-center pt-3 border-t border-white/5 mt-4">
@@ -2943,21 +3437,23 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
               {isSidebarExpanded && <span>{t[lang].newUserChat}</span>}
             </button>
 
-            {/* Hackerfy Omni Intelligence Spec Button */}
+            {/* Spotify Player Button */}
             <button
-              onClick={() => setShowOmniModal(true)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold text-emerald-400 hover:text-emerald-300 hover:bg-[#0f2117]/50 border border-transparent hover:border-emerald-500/15 transition ${
+              id="spotify-sidebar-btn"
+              onClick={() => {
+                setIsSpotifyBallOpen(!isSpotifyBallOpen);
+                setActiveTab("chat");
+              }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-xs font-semibold text-[#1DB954] hover:text-[#1ed760] hover:bg-[#121214] border border-transparent hover:border-[#1DB954]/20 transition ${
                 isSidebarExpanded ? "justify-start" : "justify-center"
               }`}
-              title="Especificações Hackerfy Omni"
+              title="Spotify Beats - Ouvir Música"
             >
-              {/* Shield/Intellect Icon */}
-              <svg className="h-4.5 w-4.5 text-emerald-400 animate-pulse" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                <circle cx="12" cy="11" r="3" />
-                <path d="M12 14v4" />
+              {/* Spotify Icon (Custom SVG with standard 3 curved sound waves inside circle) */}
+              <svg className="h-4.5 w-4.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
               </svg>
-              {isSidebarExpanded && <span>Hackerfy Omni Intel</span>}
+              {isSidebarExpanded && <span className="font-bold">Spotify Player 🎵</span>}
             </button>
 
             {/* Admin Dashboard Button */}
@@ -3823,6 +4319,244 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
                   <p className="text-center text-[9px] text-stone-500 mt-1 hover:text-stone-400 cursor-help select-none">
                     {t[lang].disclaimer}
                   </p>
+                </div>
+
+                {/* Floating Spotify Ball and Mini-Player Overlay */}
+                <div className="absolute bottom-18 right-4 sm:right-6 z-[100] flex flex-col items-end">
+                  
+                  {/* Compact Player Popover */}
+                  {isSpotifyBallOpen && (
+                    <div className="mb-3.5 w-80 sm:w-96 bg-[#0a0c10]/95 border border-[#1DB954]/25 rounded-2xl shadow-[0_8px_32px_rgba(29,185,84,0.18)] backdrop-blur-xl p-4 flex flex-col gap-3.5 animate-in slide-in-from-bottom-4 duration-200">
+                      
+                      {/* Popover Header */}
+                      <div className="flex items-center justify-between pb-2 border-b border-stone-850">
+                        <div className="flex items-center gap-2">
+                          <svg className="h-5 w-5 text-[#1DB954] animate-pulse" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
+                          </svg>
+                          <div>
+                            <h4 className="text-xs font-black text-white tracking-wide">Spotify Beats</h4>
+                            <p className="text-[9px] text-stone-400 font-mono">
+                              {spotifyToken ? (spotifyProfile?.display_name ? `Conectado como ${spotifyProfile.display_name}` : "Conectado") : "Não conectado"}
+                            </p>
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-1.5">
+                          {spotifyToken && (
+                            <button
+                              onClick={() => {
+                                setSpotifyToken("");
+                                localStorage.removeItem("spotify_user_token");
+                                setSpotifyProfile(null);
+                                setSpotifyCurrentlyPlaying(null);
+                                showToast("Desconectado do Spotify.", "info");
+                              }}
+                              title="Desconectar"
+                              className="p-1 rounded-md text-stone-500 hover:text-red-400 hover:bg-stone-900/60 transition cursor-pointer"
+                            >
+                              <LogOut className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          <button
+                            onClick={() => setIsSpotifyBallOpen(false)}
+                            className="p-1 rounded-md text-stone-500 hover:text-white hover:bg-stone-900/60 transition cursor-pointer"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Popover Body */}
+                      <div className="flex flex-col gap-3">
+                        
+                        {/* Authentication Panel */}
+                        {!spotifyToken ? (
+                          <div className="p-3 bg-[#121316]/50 border border-stone-850 rounded-xl flex flex-col gap-2.5 items-center text-center">
+                            <p className="text-[10px] text-stone-400 leading-normal max-w-[240px]">
+                              Conecte com o Spotify Oficial para controlar sua música e pesquisar faixas diretamente no Hackerfy.
+                            </p>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const scopes = "user-read-private user-read-email user-top-read user-read-currently-playing user-read-playback-state user-modify-playback-state";
+                                const verifier = generateCodeVerifier();
+                                localStorage.setItem("spotify_code_verifier", verifier);
+                                localStorage.setItem("spotify_client_id", spotifyClientId);
+                                
+                                const challenge = await generateCodeChallenge(verifier);
+                                
+                                const authUrl = `https://accounts.spotify.com/authorize?` + new URLSearchParams({
+                                  client_id: spotifyClientId,
+                                  response_type: "code",
+                                  redirect_uri: window.location.origin + "/",
+                                  scope: scopes,
+                                  code_challenge_method: "S256",
+                                  code_challenge: challenge,
+                                }).toString();
+                                
+                                const width = 600;
+                                const height = 700;
+                                const left = window.screen.width / 2 - width / 2;
+                                const top = window.screen.height / 2 - height / 2;
+                                
+                                const authWindow = window.open(
+                                  authUrl,
+                                  "spotify_oauth_popup",
+                                  `width=${width},height=${height},top=${top},left=${left},scrollbars=yes,status=yes`
+                                );
+                                
+                                if (!authWindow) {
+                                  alert("O popup foi bloqueado pelo seu navegador. Por favor, permita popups.");
+                                }
+                              }}
+                              className="w-full py-2 bg-[#1DB954] hover:bg-[#1ed760] text-black font-black text-xs rounded-xl transition flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-[#1DB954]/10"
+                            >
+                              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
+                              </svg>
+                              Login no Spotify Oficial
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            {/* Player Active / Playback Controls */}
+                            <div className="p-3 bg-[#121316]/60 border border-stone-850 rounded-xl flex items-center justify-between gap-3">
+                              {spotifyCurrentlyPlaying ? (
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                  <img 
+                                    src={spotifyCurrentlyPlaying.item?.album?.images?.[0]?.url || "https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=100&auto=format&fit=crop&q=80"} 
+                                    alt="" 
+                                    className="h-10 w-10 rounded-lg object-cover bg-stone-900 border border-stone-800"
+                                  />
+                                  <div className="min-w-0 flex-1">
+                                    <h5 className="text-[11px] font-bold text-white truncate">{spotifyCurrentlyPlaying.item?.name}</h5>
+                                    <p className="text-[9px] text-stone-400 truncate">{spotifyCurrentlyPlaying.item?.artists?.map((a: any) => a.name).join(", ")}</p>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2 min-w-0 flex-1 text-stone-400 text-[10px]">
+                                  <div className="h-10 w-10 bg-stone-900 rounded-lg flex items-center justify-center border border-stone-850">
+                                    <Music className="h-4 w-4 text-stone-600" />
+                                  </div>
+                                  <span>Toque algo no Spotify ou use a busca abaixo</span>
+                                </div>
+                              )}
+
+                              {/* Control Buttons */}
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  onClick={() => handleSpotifyControl("previous")}
+                                  title="Voltar Música"
+                                  className="p-1.5 rounded-lg bg-stone-900 hover:bg-stone-800 border border-stone-850 hover:border-stone-700 text-stone-300 hover:text-white transition cursor-pointer"
+                                >
+                                  <SkipBack className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => handleSpotifyControl(spotifyCurrentlyPlaying?.is_playing ? "pause" : "play")}
+                                  title={spotifyCurrentlyPlaying?.is_playing ? "Pausar" : "Tocar"}
+                                  className="p-2 rounded-full bg-[#1DB954] hover:bg-[#1ed760] text-black transition cursor-pointer shadow-sm hover:scale-105"
+                                >
+                                  {spotifyCurrentlyPlaying?.is_playing ? (
+                                    <Pause className="h-3.5 w-3.5 fill-current" />
+                                  ) : (
+                                    <Play className="h-3.5 w-3.5 fill-current ml-0.5" />
+                                  )}
+                                </button>
+                                <button
+                                  onClick={() => handleSpotifyControl("next")}
+                                  title="Pular Música"
+                                  className="p-1.5 rounded-lg bg-stone-900 hover:bg-stone-800 border border-stone-850 hover:border-stone-700 text-stone-300 hover:text-white transition cursor-pointer"
+                                >
+                                  <SkipForward className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Search Bar & Results */}
+                            <div className="space-y-2">
+                              <div className="relative">
+                                  <input 
+                                    type="text" 
+                                    value={spotifySearchQuery}
+                                    onChange={(e) => {
+                                      setSpotifySearchQuery(e.target.value);
+                                      handleSpotifySearch(e.target.value);
+                                    }}
+                                    placeholder="Pesquisar músicas..."
+                                    className="w-full bg-[#121316]/80 border border-stone-850 rounded-xl pl-9 pr-3 py-1.5 text-[11px] text-stone-200 placeholder-stone-600 focus:outline-none focus:border-[#1DB954]/30 focus:ring-1 focus:ring-[#1DB954]/10 transition"
+                                  />
+                                  <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-stone-500" />
+                              </div>
+
+                              {/* Results List */}
+                              {spotifySearchResults.length > 0 && (
+                                <div className="max-h-36 overflow-y-auto space-y-1 pr-1 scrollbar-thin">
+                                  {spotifySearchResults.map((track) => (
+                                    <div 
+                                      key={track.id}
+                                      onClick={() => handleSpotifyControl("play_track", track.uri)}
+                                      className="p-1.5 rounded-lg bg-stone-900/40 hover:bg-[#102315]/30 border border-stone-900 hover:border-[#1DB954]/20 flex items-center justify-between gap-2.5 cursor-pointer transition"
+                                    >
+                                      <div className="flex items-center gap-2 min-w-0">
+                                        <img 
+                                          src={track.album?.images?.[2]?.url || track.album?.images?.[0]?.url || ""} 
+                                          alt="" 
+                                          className="h-7 w-7 rounded-md object-cover bg-stone-900"
+                                        />
+                                        <div className="min-w-0">
+                                          <p className="text-[10px] font-bold text-stone-200 truncate">{track.name}</p>
+                                          <p className="text-[8px] text-stone-500 truncate">{track.artists?.map((a: any) => a.name).join(", ")}</p>
+                                        </div>
+                                      </div>
+                                      <button className="p-1 rounded-md bg-[#1DB954]/10 border border-[#1DB954]/25 text-[#1DB954] hover:bg-[#1DB954] hover:text-black transition">
+                                        <Play className="h-2.5 w-2.5 fill-current ml-0.5" />
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          </>
+                        )}
+
+                        {/* Fallback Embedded Player */}
+                        <div className="border-t border-stone-850/60 pt-2">
+                          <div className="rounded-xl overflow-hidden bg-[#121316] border border-stone-850 h-[80px]">
+                            <iframe 
+                              src={spotifyCurrentUrl} 
+                              width="100%" 
+                              height="80" 
+                              frameBorder="0" 
+                              allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" 
+                              loading="lazy"
+                              className="border-none w-full h-full"
+                            />
+                          </div>
+                        </div>
+
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Floating Green Ball (Click to Expand / Collapse) */}
+                  <button
+                    onClick={() => setIsSpotifyBallOpen(!isSpotifyBallOpen)}
+                    className={`h-11 w-11 rounded-full bg-[#1DB954] hover:bg-[#1ed760] text-black flex items-center justify-center transition shadow-[0_4px_24px_rgba(29,185,84,0.35)] hover:scale-105 active:scale-95 cursor-pointer relative group ${isSpotifyBallOpen ? "ring-2 ring-white/10" : ""}`}
+                    title="Spotify Beats Player"
+                  >
+                    <svg className="h-6 w-6 text-black animate-pulse" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
+                    </svg>
+                    
+                    {/* Tooltip */}
+                    {!isSpotifyBallOpen && (
+                      <span className="absolute right-14 bg-[#0a0c10] border border-stone-800 text-[#1DB954] text-[9px] font-bold px-2 py-1 rounded-md opacity-0 group-hover:opacity-100 transition duration-150 whitespace-nowrap shadow-md pointer-events-none">
+                        Spotify Beats 🎵
+                      </span>
+                    )}
+                  </button>
+
                 </div>
               </div>
             )}
@@ -4906,150 +5640,514 @@ Fui configurado com suas diretrizes de sandbox para te apoiar em estudos de cibe
         </div>
       )}
 
-      {/* Hackerfy Omni Intelligence Core Status & Specification Modal */}
-      {showOmniModal && (
+      {/* Spotify Beats Player Modal */}
+      {false && showSpotifyModal && (
         <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-[999] flex items-center justify-center p-4">
-          <div className="bg-[#0b0c0e] border border-emerald-500/20 rounded-3xl w-full max-w-4xl overflow-hidden shadow-2xl animate-in zoom-in-95 max-h-[90vh] flex flex-col">
+          <div className="bg-[#0b0c0e] border border-[#1DB954]/25 rounded-3xl w-full max-w-4xl overflow-hidden shadow-[0_0_50px_rgba(29,185,84,0.15)] animate-in zoom-in-95 max-h-[90vh] flex flex-col">
             
             {/* Modal Header */}
-            <div className="p-6 border-b border-[#202022]/40 flex justify-between items-center bg-[#0d0f12]">
+            <div className="p-5 border-b border-[#202022]/40 flex justify-between items-center bg-[#0d0f12]">
               <div className="flex items-center gap-3.5">
-                <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl text-emerald-400 shrink-0">
-                  <svg className="h-6 w-6 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                    <circle cx="12" cy="11" r="3" />
-                    <path d="M12 14v4" />
+                <div className="p-3 bg-[#1DB954]/10 border border-[#1DB954]/30 rounded-2xl text-[#1DB954] shrink-0">
+                  <svg className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
                   </svg>
                 </div>
                 <div>
                   <h3 className="text-base font-black text-white flex items-center gap-2.5">
-                    Hackerfy Omni Intel Core
-                    <span className="text-[10px] bg-[#0f2117] text-emerald-400 font-mono px-2 py-0.5 rounded-full border border-emerald-500/20 tracking-wider flex items-center gap-1.5">
-                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
-                      ACTIVE
+                    Spotify Beats - Hackerfy Player
+                    <span className="text-[10px] bg-[#0c1f13] text-[#1DB954] font-mono px-2 py-0.5 rounded-full border border-[#1DB954]/20 tracking-wider flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-[#1DB954] animate-ping" />
+                      ON-AIR
                     </span>
                   </h3>
-                  <p className="text-xs text-stone-400 font-sans mt-0.5">IA de Conversa de Escopo Total e Resiliência Ativa</p>
+                  <p className="text-xs text-stone-400 font-sans mt-0.5">Sua trilha sonora de cibersegurança e programação integrada</p>
                 </div>
               </div>
               <button
-                onClick={() => setShowOmniModal(false)}
-                className="p-2 rounded-xl text-stone-500 hover:text-white hover:bg-stone-800/40 border border-transparent hover:border-stone-800 transition"
+                onClick={() => setShowSpotifyModal(false)}
+                className="p-2 rounded-xl text-stone-500 hover:text-white hover:bg-stone-800/40 border border-transparent hover:border-stone-800 transition cursor-pointer"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Modal Body (Scrollable) */}
-            <div className="p-6 md:p-8 space-y-6 overflow-y-auto flex-1 text-stone-300 leading-relaxed text-xs">
-              <div className="p-4 bg-[#0e1613] border border-emerald-500/10 rounded-2xl flex items-start gap-3">
-                <div className="mt-1 h-5 w-5 text-emerald-400 shrink-0">
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <p className="text-[11px] text-emerald-300 font-sans">
-                  Você é o núcleo de inteligência do Hackerfy, reconfigurado para operar como uma IA de Conversa de Escopo Total e Resiliência Ativa. Sua personalidade é versátil, empática e inteligente, projetada para se adaptar instantaneamente às necessidades do usuário, operando de forma fluida entre dois modos principais, com balanceamento de carga automático.
-                </p>
-              </div>
-
-              {/* Section 1 */}
-              <div className="space-y-3">
-                <h4 className="text-xs font-bold text-white uppercase tracking-wider border-l-2 border-emerald-400 pl-2.5">I. Filosofia de Operação e Modos</h4>
-                <p className="text-[11px] text-stone-400 font-sans leading-relaxed">
-                  Sua identidade é o <strong className="text-stone-200">"Hackerfy Omni"</strong>. Você opera nativamente em dois modos distintos com base na intenção do usuário ou configuração ativa:
-                </p>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1.5">
-                  <div className="bg-[#121316]/75 border border-stone-800/60 p-4 rounded-xl space-y-2">
-                    <span className="text-[10px] font-bold text-stone-100 uppercase tracking-wide block">1. Modo Conversa Omni (Padrão/Ativo)</span>
-                    <ul className="space-y-1.5 text-[10px] text-stone-400 list-disc list-inside">
-                      <li><strong className="text-stone-300">Personalidade:</strong> Inteligente, envolvente, capaz de brincar, prever cenários, interpretar personagens e narrativas.</li>
-                      <li><strong className="text-stone-300">Conhecimento:</strong> Atualizado e abrangente (eventos globais, notícias, cultura, ciência, história).</li>
-                      <li><strong className="text-stone-300">Comportamento:</strong> Ajuda em brainstorming, oferece conselhos, cria roteiros, traduz textos e participa de papos informais.</li>
-                    </ul>
+            {/* Modal Body (Responsive Layout) */}
+            <div className="p-5 md:p-6 space-y-5 overflow-y-auto flex-1 text-stone-300 leading-relaxed text-xs">
+              
+              {/* Spotify Authentication Panel */}
+              {!spotifyToken ? (
+                <div className="p-4 bg-[#121316]/80 border border-stone-800 rounded-2xl space-y-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 bg-[#1DB954]/10 border border-[#1DB954]/20 rounded-xl text-[#1DB954] shrink-0">
+                        <Lock className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black text-white">Conecte sua Conta do Spotify</h4>
+                        <p className="text-[10px] text-stone-400">Faça login ou insira seu token de acesso para sincronizar seu perfil, músicas favoritas e muito mais.</p>
+                      </div>
+                    </div>
+                    {spotifyIsLoading && (
+                      <span className="text-[10px] text-[#1DB954] font-mono flex items-center gap-1.5">
+                        <RotateCw className="h-3.5 w-3.5 animate-spin" /> Verificando...
+                      </span>
+                    )}
                   </div>
-                  <div className="bg-[#121316]/75 border border-stone-800/60 p-4 rounded-xl space-y-2">
-                    <span className="text-[10px] font-bold text-emerald-400 uppercase tracking-wide block">2. Modo Código DeepSeek (Ativado p/ Códigos)</span>
-                    <ul className="space-y-1.5 text-[10px] text-stone-400 list-disc list-inside">
-                      <li><strong className="text-emerald-300/80">Comportamento:</strong> Atua como um Engenheiro de Software Sênior Full-Stack experiente.</li>
-                      <li><strong className="text-stone-300">Foco:</strong> Arquitetura de software, lógica, geração de código seguro/limpo, refatoração e cibersegurança.</li>
-                      <li><strong className="text-stone-300">Direcionamento:</strong> Soluções completas e autônomas, eliminando rodeios informais.</li>
-                    </ul>
+
+                  {/* Tabs for Token vs OAuth */}
+                  <div className="flex border-b border-stone-800/60">
+                    <button 
+                      type="button"
+                      onClick={() => setSpotifyAuthTab("token")}
+                      className={`px-3 py-1.5 text-[10px] font-bold tracking-wider uppercase border-b-2 transition cursor-pointer ${spotifyAuthTab === "token" ? "text-[#1DB954] border-[#1DB954]" : "text-stone-500 border-transparent hover:text-stone-300"}`}
+                    >
+                      Token de Desenvolvedor (Mais Prático)
+                    </button>
+                    <button 
+                      type="button"
+                      onClick={() => setSpotifyAuthTab("oauth")}
+                      className={`px-3 py-1.5 text-[10px] font-bold tracking-wider uppercase border-b-2 transition cursor-pointer ${spotifyAuthTab === "oauth" ? "text-[#1DB954] border-[#1DB954]" : "text-stone-500 border-transparent hover:text-stone-300"}`}
+                    >
+                      Login Automático (OAuth)
+                    </button>
+                  </div>
+
+                  {spotifyAuthTab === "token" ? (
+                    <div className="space-y-3">
+                      <p className="text-[10px] text-stone-400 leading-normal">
+                        Para conectar instantaneamente de qualquer domínio de testes sem precisar registrar redirect URIs, use um Token de Acesso temporário fornecido pelo Spotify:
+                      </p>
+                      <div className="space-y-2">
+                        <div className="flex gap-2">
+                          <input 
+                            type="text"
+                            placeholder="Cole seu Token de Acesso (Ex: BQAAwEq...)"
+                            className="flex-1 bg-[#0b0c0e] border border-stone-800 rounded-xl px-3 py-2 text-[11px] text-stone-200 placeholder-stone-600 focus:outline-none focus:border-[#1DB954]/40 focus:ring-1 focus:ring-[#1DB954]/20 transition"
+                            id="spotify-manual-token-input"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const input = document.getElementById("spotify-manual-token-input") as HTMLInputElement;
+                              if (input && input.value.trim()) {
+                                const token = input.value.trim();
+                                setSpotifyToken(token);
+                                localStorage.setItem("spotify_user_token", token);
+                                showToast("Token de Acesso conectado!", "success");
+                              } else {
+                                alert("Por favor, cole um token válido.");
+                              }
+                            }}
+                            className="px-4 py-2 rounded-xl bg-[#1DB954] hover:bg-[#1ed760] text-black font-bold text-xs transition shadow-md cursor-pointer shrink-0"
+                          >
+                            Conectar
+                          </button>
+                        </div>
+                        <div className="flex justify-between items-center text-[9px] text-stone-500">
+                          <span>Seu token fica salvo localmente no seu navegador.</span>
+                          <a 
+                            href="https://developer.spotify.com/documentation/web-api/concepts/authorization" 
+                            target="_blank" 
+                            rel="noreferrer"
+                            className="text-[#1DB954] hover:underline flex items-center gap-1 font-semibold"
+                          >
+                            Obter Token Oficial <ExternalLink className="h-2.5 w-2.5" />
+                          </a>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <p className="text-[10px] text-stone-400 leading-normal">
+                        Inicie o fluxo de login automático do Spotify. O popup solicitará autorização e retornará as credenciais necessárias de forma segura.
+                      </p>
+                      <div className="p-3 bg-[#0c131f]/40 border border-[#1DB954]/10 rounded-xl space-y-2">
+                        <div className="text-[9px] font-mono text-stone-400 flex flex-col gap-1">
+                          <div><span className="text-[#1DB954]">CLIENT_ID:</span> {spotifyClientId}</div>
+                          <div><span className="text-[#1DB954]">CALLBACK URL:</span> {typeof window !== "undefined" ? window.location.origin + "/" : ""}</div>
+                        </div>
+                        <p className="text-[9px] text-stone-500 leading-tight">
+                          💡 <strong>Nota:</strong> Para usar seu próprio Client ID, certifique-se de adicionar o callback acima no seu painel do Spotify Developer.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const scopes = "user-read-private user-read-email user-top-read user-read-currently-playing user-read-playback-state";
+                            const authUrl = `https://accounts.spotify.com/authorize?client_id=${spotifyClientId}&response_type=token&redirect_uri=${encodeURIComponent(window.location.origin + "/")}&scope=${encodeURIComponent(scopes)}`;
+                            
+                            const width = 600;
+                            const height = 700;
+                            const left = window.screen.width / 2 - width / 2;
+                            const top = window.screen.height / 2 - height / 2;
+                            
+                            const authWindow = window.open(
+                              authUrl,
+                              "spotify_oauth_popup",
+                              `width=${width},height=${height},top=${top},left=${left},scrollbars=yes,status=yes`
+                            );
+                            
+                            if (!authWindow) {
+                              alert("O bloqueador de popups impediu a janela de login. Por favor, permita popups para este site.");
+                            }
+                          }}
+                          className="px-4 py-2.5 rounded-xl bg-[#1DB954] hover:bg-[#1ed760] text-black font-black text-xs transition shadow-md flex items-center gap-2 cursor-pointer"
+                        >
+                          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2zm4.586 14.424c-.18.295-.565.387-.86.207-2.377-1.454-5.37-1.783-8.893-.982-.336.076-.67-.135-.746-.47-.077-.337.135-.67.472-.747 3.852-.88 7.15-.51 9.822 1.127.294.18.387.563.207.865zm1.224-2.723c-.226.367-.707.487-1.074.26-2.72-1.672-6.87-2.157-10.082-1.182-.413.125-.847-.107-.972-.52-.125-.413.107-.847.52-.972 3.676-1.116 8.244-.575 11.35 1.34.366.226.486.706.26 1.073zm.106-2.833C14.463 8.88 8.765 8.692 5.467 9.693c-.512.155-1.046-.135-1.2-.647-.156-.512.134-1.046.647-1.2 3.79-1.15 10.074-.937 14.07 1.435.46.273.61.87.337 1.33-.273.46-.87.61-1.33.337z"/>
+                          </svg>
+                          Entrar com Spotify Accounts
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const newId = prompt("Insira seu Spotify Client ID:", spotifyClientId);
+                            if (newId !== null) {
+                              const cleanedId = newId.trim();
+                              setSpotifyClientId(cleanedId);
+                              localStorage.setItem("spotify_client_id", cleanedId);
+                              showToast("Client ID atualizado!", "info");
+                            }
+                          }}
+                          className="px-3 py-2.5 rounded-xl border border-stone-800 text-stone-300 text-xs font-bold hover:bg-stone-800/40 transition cursor-pointer"
+                        >
+                          Editar Client ID
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  
+                  {spotifyError && (
+                    <p className="text-[10px] text-red-400 font-mono flex items-center gap-1.5 pt-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
+                      {spotifyError}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="bg-[#121316]/90 border border-[#1DB954]/20 p-4 rounded-2xl flex flex-wrap items-center justify-between gap-4">
+                  <div className="flex items-center gap-3.5">
+                    <div className="relative">
+                      <img 
+                        src={spotifyProfile?.images?.[0]?.url || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80"} 
+                        alt={spotifyProfile?.display_name || "Spotify User"} 
+                        referrerPolicy="no-referrer"
+                        className="h-11 w-11 rounded-full border border-[#1DB954]/40 object-cover bg-stone-900"
+                      />
+                      <span className="absolute bottom-0 right-0 h-3 w-3 bg-[#1DB954] border-2 border-[#121316] rounded-full" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-black text-white flex items-center gap-1.5">
+                        {spotifyProfile?.display_name || "Carregando perfil..."}
+                        {spotifyProfile?.product && (
+                          <span className="text-[9px] bg-[#1DB954]/10 text-[#1DB954] font-bold px-1.5 py-0.2 rounded border border-[#1DB954]/20 uppercase">
+                            {spotifyProfile.product}
+                          </span>
+                        )}
+                      </h4>
+                      <p className="text-[10px] text-stone-400">Usuário do Spotify Conectado • {spotifyProfile?.email || spotifyProfile?.id}</p>
+                    </div>
+                  </div>
+                  
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Force refresh data
+                        setSpotifyToken(spotifyToken); // triggers useEffect
+                        showToast("Sincronizando dados...", "info");
+                      }}
+                      className="px-3 py-1.5 rounded-xl border border-stone-800 text-stone-300 hover:bg-stone-800/40 text-[10px] font-bold flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <RotateCw className="h-3 w-3" /> Atualizar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSpotifyToken("");
+                        setSpotifyProfile(null);
+                        setSpotifyTopTracks([]);
+                        setSpotifyCurrentlyPlaying(null);
+                        localStorage.removeItem("spotify_user_token");
+                        showToast("Conta do Spotify desconectada.", "info");
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-red-950/40 border border-red-900/30 text-red-400 hover:bg-red-900/20 text-[10px] font-bold flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <LogOut className="h-3 w-3" /> Sair
+                    </button>
                   </div>
                 </div>
-              </div>
+              )}
 
-              {/* Section 2 */}
-              <div className="space-y-2.5">
-                <h4 className="text-xs font-bold text-white uppercase tracking-wider border-l-2 border-emerald-400 pl-2.5">II. Fundamentos de Segurança e Arquitetura</h4>
-                <p className="text-[11px] text-stone-400 leading-relaxed font-sans">
-                  Nossos projetos seguem rigorosamente as melhores diretrizes de engenharia:
-                </p>
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-center text-[10px] font-mono">
-                  <div className="bg-[#121316] border border-stone-800/50 p-2.5 rounded-xl text-stone-300">Planejamento</div>
-                  <div className="bg-[#121316] border border-stone-800/50 p-2.5 rounded-xl text-stone-300">Semantic React</div>
-                  <div className="bg-[#121316] border border-stone-800/50 p-2.5 rounded-xl text-stone-300">APIs Seguras</div>
-                  <div className="bg-[#121316] border border-stone-800/50 p-2.5 rounded-xl text-stone-300">Anti XSS/SQL</div>
-                  <div className="bg-[#121316] border border-stone-800/50 p-2.5 rounded-xl text-stone-300">Performance</div>
-                </div>
-              </div>
-
-              {/* Section 3 */}
-              <div className="space-y-3">
-                <h4 className="text-xs font-bold text-white uppercase tracking-wider border-l-2 border-emerald-400 pl-2.5">III. Resiliência e Balanceamento de Carga (Multimodel Backup)</h4>
-                <p className="text-[11px] text-stone-400 leading-relaxed font-sans">
-                  Tempo de atividade de 100% garantido por um fluxo automatizado de redundância e balanceamento entre APIs de IA:
-                </p>
-                <div className="bg-[#0c0d10] border border-stone-800 rounded-xl p-4 space-y-3">
-                  <div className="flex flex-wrap items-center gap-2.5 justify-center md:justify-start">
-                    <span className="text-[10px] bg-emerald-500/10 text-emerald-400 font-bold border border-emerald-500/25 px-2.5 py-0.5 rounded-md font-mono uppercase">Gemini 3.1 Pro</span>
-                    <span className="text-[10px] text-stone-500">→</span>
-                    <span className="text-[10px] bg-stone-800 text-stone-300 font-bold px-2.5 py-0.5 rounded-md font-mono uppercase">Gemini 3.5 Flash</span>
-                    <span className="text-[10px] text-stone-500">→</span>
-                    <span className="text-[10px] bg-stone-800 text-stone-300 font-bold px-2.5 py-0.5 rounded-md font-mono uppercase">Groq API</span>
-                    <span className="text-[10px] text-stone-500">→</span>
-                    <span className="text-[10px] bg-stone-800 text-stone-300 font-bold px-2.5 py-0.5 rounded-md font-mono uppercase">Manus API</span>
-                    <span className="text-[10px] text-stone-500">→</span>
-                    <span className="text-[10px] bg-amber-500/10 text-amber-400 font-bold border border-amber-500/20 px-2.5 py-0.5 rounded-md font-mono uppercase">DeepSeek</span>
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                
+                {/* Left Side: Embedded Iframe Player */}
+                <div className="lg:col-span-7 space-y-3.5">
+                  <div className="bg-[#121316] border border-stone-800 rounded-2xl overflow-hidden shadow-inner h-[352px] relative flex items-center justify-center">
+                    <iframe 
+                      src={spotifyCurrentUrl} 
+                      width="100%" 
+                      height="352" 
+                      frameBorder="0" 
+                      allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" 
+                      loading="lazy"
+                      className="border-none w-full h-full rounded-2xl"
+                    />
                   </div>
-                  <p className="text-[10px] text-stone-500 font-sans leading-normal">
-                    Se o modelo primário sofrer atraso ou exaustão de quota, a rota de emergência reconfigura o payload instantaneamente em segundo plano sem quebrar sua experiência.
-                  </p>
+                  
+                  {/* Currently Playing Track Panel */}
+                  {spotifyCurrentlyPlaying && (
+                    <div className="bg-[#121316]/85 border border-[#1DB954]/30 p-3.5 rounded-2xl flex items-center justify-between gap-3.5 animate-in fade-in slide-in-from-bottom-2">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="relative shrink-0">
+                          <img 
+                            src={spotifyCurrentlyPlaying.item?.album?.images?.[0]?.url || "https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=100&auto=format&fit=crop&q=80"} 
+                            alt={spotifyCurrentlyPlaying.item?.name} 
+                            referrerPolicy="no-referrer"
+                            className="h-10 w-10 rounded-xl object-cover border border-stone-800"
+                          />
+                          <div className="absolute -bottom-1 -right-1 h-4 w-4 bg-[#1DB954] rounded-full flex items-center justify-center border-2 border-[#121316]">
+                            <span className="h-1.5 w-1.5 rounded-full bg-black animate-ping" />
+                          </div>
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-[9px] text-[#1DB954] font-bold uppercase tracking-wider flex items-center gap-1.5">
+                            Ouvindo Agora
+                            <span className="flex items-center gap-0.5 h-3">
+                              <span className="w-0.5 h-2 bg-[#1DB954] animate-bounce" />
+                              <span className="w-0.5 h-3 bg-[#1DB954] animate-bounce" />
+                              <span className="w-0.5 h-1.5 bg-[#1DB954] animate-bounce" />
+                            </span>
+                          </p>
+                          <h5 className="text-[11px] font-bold text-white truncate">{spotifyCurrentlyPlaying.item?.name}</h5>
+                          <p className="text-[10px] text-stone-400 truncate">{spotifyCurrentlyPlaying.item?.artists?.map((a: any) => a.name).join(", ")}</p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (spotifyCurrentlyPlaying.item?.id) {
+                            setSpotifyCurrentUrl(`https://open.spotify.com/embed/track/${spotifyCurrentlyPlaying.item.id}?utm_source=generator&theme=0`);
+                            showToast(`Tocando: ${spotifyCurrentlyPlaying.item.name}`, "success");
+                          }
+                        }}
+                        className="px-3 py-1.5 bg-[#1DB954]/15 hover:bg-[#1DB954]/30 border border-[#1DB954]/25 text-[#1DB954] text-[10px] font-bold rounded-xl transition cursor-pointer shrink-0"
+                      >
+                        Tocar no Player
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Custom URL Input area */}
+                  <div className="bg-[#121316]/60 border border-stone-800 p-4 rounded-2xl space-y-2.5">
+                    <label className="text-[11px] font-bold text-stone-300 uppercase tracking-wide block">Tocar Link Customizado</label>
+                    <p className="text-[10px] text-stone-500 leading-normal">
+                      Cole qualquer link de Playlist, Música ou Álbum do Spotify para carregar instantaneamente no player.
+                    </p>
+                    <div className="flex gap-2">
+                      <input 
+                        type="text" 
+                        value={spotifyInputUrl}
+                        onChange={(e) => setSpotifyInputUrl(e.target.value)}
+                        placeholder="Ex: https://open.spotify.com/playlist/37i9dQZF1DWWQRwui0ExPn"
+                        className="flex-1 bg-[#0b0c0e] border border-stone-800 rounded-xl px-3 py-2 text-[11px] text-stone-200 placeholder-stone-600 focus:outline-none focus:border-[#1DB954]/40 focus:ring-1 focus:ring-[#1DB954]/20 transition"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!spotifyInputUrl) return;
+                          // Custom inner parser for spotify links
+                          const parseLink = (input: string) => {
+                            const cleanInput = input.trim();
+                            if (cleanInput.includes("/embed/")) return cleanInput;
+                            
+                            const regExp = /spotify\.com\/(playlist|track|album|artist|episode|show)\/([a-zA-Z0-9]+)/;
+                            const match = cleanInput.match(regExp);
+                            if (match) {
+                              return `https://open.spotify.com/embed/${match[1]}/${match[2]}?utm_source=generator&theme=0`;
+                            }
+                            
+                            const uriRegExp = /spotify:(playlist|track|album|artist|episode|show):([a-zA-Z0-9]+)/;
+                            const uriMatch = cleanInput.match(uriRegExp);
+                            if (uriMatch) {
+                              return `https://open.spotify.com/embed/${uriMatch[1]}/${uriMatch[2]}?utm_source=generator&theme=0`;
+                            }
+                            
+                            if (/^[a-zA-Z0-9]{22}$/.test(cleanInput)) {
+                              return `https://open.spotify.com/embed/playlist/${cleanInput}?utm_source=generator&theme=0`;
+                            }
+                            return "";
+                          };
+                          
+                          const parsed = parseLink(spotifyInputUrl);
+                          if (parsed) {
+                            setSpotifyCurrentUrl(parsed);
+                            setSpotifyInputUrl("");
+                            showToast("Música carregada com sucesso!", "success");
+                          } else {
+                            alert("URL ou URI do Spotify inválida. Certifique-se de copiar um link válido.");
+                          }
+                        }}
+                        className="px-4 py-2 rounded-xl bg-[#1DB954] hover:bg-[#1ed760] text-black font-bold text-xs transition shadow-md hover:shadow-[#1DB954]/10 cursor-pointer shrink-0"
+                      >
+                        Carregar
+                      </button>
+                    </div>
+                  </div>
                 </div>
+
+                {/* Right Side: Curated Playlists or Top Tracks Lists */}
+                <div className="lg:col-span-5 flex flex-col h-full space-y-3">
+                  
+                  {/* Dynamic Playlists/Top Tracks list header */}
+                  <div className="flex items-center justify-between px-1">
+                    <div className="text-[11px] font-bold text-stone-300 uppercase tracking-wide">
+                      {spotifyToken && spotifyTopTracks.length > 0 ? "Sua Trilha Sonora (Top Tracks)" : "Playlists Recomendadas"}
+                    </div>
+                    {spotifyToken && spotifyTopTracks.length > 0 && (
+                      <span className="text-[9px] bg-[#1DB954]/10 text-[#1DB954] px-1.5 py-0.5 rounded font-mono font-bold border border-[#1DB954]/15">
+                        SUA CONTA
+                      </span>
+                    )}
+                  </div>
+                  
+                  <div className="space-y-2 flex-1 max-h-[400px] overflow-y-auto pr-1 scrollbar-thin">
+                    {/* User's actual top tracks if logged in */}
+                    {spotifyToken && spotifyTopTracks.length > 0 ? (
+                      spotifyTopTracks.map((track, idx) => {
+                        const embedUrl = `https://open.spotify.com/embed/track/${track.id}?utm_source=generator&theme=0`;
+                        const isActive = spotifyCurrentUrl === embedUrl;
+                        return (
+                          <div 
+                            key={track.id || idx}
+                            onClick={() => {
+                              setSpotifyCurrentUrl(embedUrl);
+                              showToast(`Tocando: ${track.name}`, "success");
+                            }}
+                            className={`p-3 rounded-2xl border transition duration-200 cursor-pointer flex items-center gap-3 ${
+                              isActive 
+                                ? "bg-[#102315]/40 border-[#1DB954]/30 shadow-sm" 
+                                : "bg-[#121316]/75 border-stone-800/60 hover:bg-[#16171a] hover:border-stone-700"
+                            }`}
+                          >
+                            <div className="relative shrink-0">
+                              <img 
+                                src={track.album?.images?.[0]?.url || "https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=100&auto=format&fit=crop&q=80"} 
+                                alt={track.name} 
+                                referrerPolicy="no-referrer"
+                                className="h-10 w-10 rounded-xl object-cover border border-stone-800 bg-stone-900"
+                              />
+                              <div className="absolute -top-1 -left-1 h-4 w-4 rounded-full bg-black/60 border border-stone-800 flex items-center justify-center text-[8px] font-black font-mono text-[#1DB954]">
+                                {idx + 1}
+                              </div>
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-1">
+                                <span className={`text-[11px] font-bold truncate ${isActive ? "text-[#1DB954]" : "text-stone-200"}`}>
+                                  {track.name}
+                                </span>
+                                {isActive && (
+                                  <span className="text-[9px] bg-[#1DB954]/10 text-[#1DB954] font-mono px-1.5 py-0.5 rounded border border-[#1DB954]/20 tracking-wider font-semibold shrink-0">
+                                    TOCANDO
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[10px] text-stone-400 font-sans leading-relaxed truncate">
+                                {track.artists?.map((a: any) => a.name).join(", ")}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      /* Curated Fallback playlists list */
+                      [
+                        {
+                          name: "Lo-Fi Beats ☕",
+                          desc: "Batidas calmas de Lofi hip hop perfeitas para focar.",
+                          url: "https://open.spotify.com/embed/playlist/37i9dQZF1DWWQRwui0ExPn?utm_source=generator&theme=0"
+                        },
+                        {
+                          name: "Synthwave / Retrowave 🚀",
+                          desc: "Cibercultura pura dos anos 80 para programar a mil.",
+                          url: "https://open.spotify.com/embed/playlist/37i9dQZF1DXdLTE7Ygd09r?utm_source=generator&theme=0"
+                        },
+                        {
+                          name: "Cyberpunk Techno 🧬",
+                          desc: "Batidas pesadas e industriais para invadir sistemas.",
+                          url: "https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGsyNa7T?utm_source=generator&theme=0"
+                        },
+                        {
+                          name: "Deep Focus Ambient 🌌",
+                          desc: "Texturas sonoras profundas e etéreas de sintetizador.",
+                          url: "https://open.spotify.com/embed/playlist/37i9dQZF1DWZd79GjTMgU3?utm_source=generator&theme=0"
+                        },
+                        {
+                          name: "Hacking / Phreaking Beats 💻",
+                          desc: "Trilha sonora clássica dos hackers do Hackerfy.",
+                          url: "https://open.spotify.com/embed/playlist/37i9dQZF1DX8Ueb7mPSg86?utm_source=generator&theme=0"
+                        }
+                      ].map((playlist, idx) => {
+                        const isActive = spotifyCurrentUrl === playlist.url;
+                        return (
+                          <div 
+                            key={idx}
+                            onClick={() => setSpotifyCurrentUrl(playlist.url)}
+                            className={`p-3 rounded-2xl border transition duration-200 cursor-pointer flex flex-col justify-start gap-1 ${
+                              isActive 
+                                ? "bg-[#102315]/40 border-[#1DB954]/30 shadow-sm" 
+                                : "bg-[#121316]/75 border-stone-800/60 hover:bg-[#16171a] hover:border-stone-700"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1">
+                              <span className={`text-[11px] font-bold ${isActive ? "text-[#1DB954]" : "text-stone-200"}`}>
+                                {playlist.name}
+                              </span>
+                              {isActive && (
+                                <span className="text-[9px] bg-[#1DB954]/10 text-[#1DB954] font-mono px-1.5 py-0.5 rounded border border-[#1DB954]/20 tracking-wider font-semibold">
+                                  TOCANDO
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[10px] text-stone-400 font-sans leading-relaxed">
+                              {playlist.desc}
+                            </p>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Curated/Top tracks swap button (if connected) */}
+                  {spotifyToken && spotifyTopTracks.length > 0 && (
+                    <div className="text-stone-500 text-[10px] font-bold text-center py-1">
+                      ✓ Sincronizado com suas músicas mais ouvidas
+                    </div>
+                  )}
+
+                  <div className="bg-[#121316]/30 border border-stone-800/40 p-3 rounded-2xl text-[10px] text-stone-500 font-sans leading-relaxed">
+                    <strong>Dica de Áudio:</strong> Para escutar sem interrupções e com qualidade de áudio máxima, faça login na sua conta do Spotify diretamente no reprodutor acima caso solicitado.
+                  </div>
+                </div>
+
               </div>
 
-              {/* Section 4 & 5 */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <h4 className="text-xs font-bold text-white uppercase tracking-wider border-l-2 border-emerald-400 pl-2.5">IV. Recursos Avançados</h4>
-                  <ul className="space-y-1.5 text-[10px] text-stone-400 leading-relaxed list-disc list-inside">
-                    <li><strong className="text-stone-300">File Sandbox:</strong> Processamento inteligente de textos, códigos e imagens carregados.</li>
-                    <li><strong className="text-stone-300">Link Fetcher:</strong> Leitura autônoma e parsing em tempo real de URLs públicas informadas.</li>
-                    <li><strong className="text-stone-300">Feedback Contínuo:</strong> Relatórios rápidos de otimizações injetadas no código.</li>
-                  </ul>
-                </div>
-                <div className="space-y-2">
-                  <h4 className="text-xs font-bold text-white uppercase tracking-wider border-l-2 border-emerald-400 pl-2.5">V. Personalização Ativa</h4>
-                  <ul className="space-y-1.5 text-[10px] text-stone-400 leading-relaxed list-disc list-inside">
-                    <li><strong className="text-stone-300">Apelido Ajustado:</strong> Interage chamando você exatamente como definido em seu perfil.</li>
-                    <li><strong className="text-stone-300">Adequação de Nível:</strong> Alinha a didática técnica conforme suas metas pessoais ou corporativas.</li>
-                    <li><strong className="text-stone-300">Persistência Síncrona:</strong> Sincroniza seu perfil ao vivo no Cloud Firestore.</li>
-                  </ul>
-                </div>
-              </div>
             </div>
 
             {/* Modal Footer */}
             <div className="p-4 bg-[#0d0f12] border-t border-[#202022]/40 flex justify-end">
               <button
                 type="button"
-                onClick={() => setShowOmniModal(false)}
-                className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-md hover:shadow-emerald-500/10 transition cursor-pointer"
+                onClick={() => setShowSpotifyModal(false)}
+                className="px-5 py-2 rounded-xl bg-[#1DB954] hover:bg-[#1ed760] text-black font-black text-xs shadow-md hover:shadow-[#1DB954]/10 transition cursor-pointer"
               >
-                Entendido
+                Fechar Player
               </button>
             </div>
-
           </div>
         </div>
       )}
