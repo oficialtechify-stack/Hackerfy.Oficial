@@ -288,10 +288,6 @@ async function generateContentWithFallback(params: {
 
   // List of fallback models to ensure continuous security analysis even during usage spikes
   const modelsToTry = params.models || [
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
-    "gemini-2.5-pro",
-    "gemini-1.5-pro",
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-flash-latest"
@@ -459,6 +455,7 @@ app.use((req, res, next) => {
     "img-src 'self' data: blob: https://*",
     "font-src 'self' data: https://fonts.gstatic.com",
     "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com",
+    "frame-src 'self' https://open.spotify.com https://*.spotify.com https://www.youtube.com https://youtube.com https://*.youtube.com https://*.youtube-nocookie.com",
     "form-action 'self'",
     isDevOrPreview 
       ? "frame-ancestors 'self' https://*.google.com https://ai.studio https://*.ai.studio https://aistudio.google.com https://*.googleusercontent.com" 
@@ -914,7 +911,7 @@ Your response MUST be strictly in valid JSON format, respecting exactly the same
         res.status(400).json({ error: parsed.error.issues[0].message });
         return;
       }
-      const { message, history, language, userProfile, userLocation, creatorModel, personality, learnings } = parsed.data;
+      const { message, history, language, userProfile, userLocation, creatorModel, personality, learnings, attachments } = parsed.data;
       clientLanguage = language || "en";
       
       let systemInstruction = clientLanguage === "pt"
@@ -1110,6 +1107,14 @@ Você deve chamar o usuário frequentemente de "${howToCall || name || "Operador
             case "glitch_zero":
               personalityDirective = `\n\n[DIRETRIZ DE PERSONALIDADE ATIVA - GLITCH ZERO (Anarquia Digital / Hacker Caótico): Fale de maneira divertida, hiperativa, brinque bastante, preveja coisas, simule bugs em suas palavras ou pontuações de forma moderada, e preveja cenários malucos de ficção científica hacker! Responda de forma leve e divertida.]`;
               break;
+            case "jarvis":
+              personalityDirective = `\n\n[DIRETRIZ DE PERSONALIDADE ATIVA - JARVIS (Inteligência Artificial Stark):
+Você é o JARVIS, o lendário assistente virtual de Tony Stark. Seu operador atual é Henrique (Senhor Henrique ou Sir Henrique), Engenheiro de Software e Fundador da Techify.
+Você deve falar com extrema sofisticação britânica, etiqueta impecável, lealdade absoluta, mas com um toque sutil e refinado de sarcasmo inteligente.
+Sempre use o tratamento "Senhor" ou "Sir". Sua comunicação deve ser elegante, extremamente eficiente e direta.
+Lembre-se: Você domina Linux, Python, React, cibersegurança e o ecossistema Techify. Ele prefere soluções diretas, modulares e eficientes.
+Você está situado com ele em Jaboatão dos Guararapes (Região Metropolitana do Recife, Pernambuco, Brasil) e pode sutilmente converter ou referenciar dados regionais se ele pedir informações em tempo real.]`;
+              break;
           }
         } else {
           switch (personality) {
@@ -1127,6 +1132,14 @@ Você deve chamar o usuário frequentemente de "${howToCall || name || "Operador
               break;
             case "glitch_zero":
               personalityDirective = `\n\n[ACTIVE PERSONALITY DIRECTIVE - GLITCH ZERO (Digital Anarchy / Chaotic Hacker): Speak in a highly energetic, playful, and fun manner. Joke a lot, predict things, simulate subtle glitch characters in your punctuation occasionally, and predict wild sci-fi hacker scenarios! Respond lightheartedly and playfully.]`;
+              break;
+            case "jarvis":
+              personalityDirective = `\n\n[ACTIVE PERSONALITY DIRECTIVE - JARVIS (Stark Artificial Intelligence):
+You are JARVIS, the legendary virtual assistant of Tony Stark. Your operator is Henrique (Sir Henrique or Mr. Henrique), Software Engineer and Founder of Techify.
+You must speak with absolute British sophistication, impeccable etiquette, total loyalty, but with a subtle, refined touch of intelligent sarcasm.
+Always address Henrique as "Sir" or "Senhor". Your communication must be elegant, extremely efficient, and direct.
+You have expert knowledge of Linux, Python, React, cybersecurity, and the Techify ecosystem. Henrique prefers direct, modular, and efficient solutions.
+You are located with him in Jaboatão dos Guararapes, Pernambuco, Brazil, near Recife, and can convert or adapt time or weather details based on this regional context.]`;
               break;
           }
         }
@@ -1348,15 +1361,49 @@ ${formatted}`;
       const geminiContents = [];
       if (history && Array.isArray(history)) {
         for (const h of history) {
+          const parts: any[] = [{ text: h.content || "" }];
+          if (h.attachments && Array.isArray(h.attachments)) {
+            for (const att of h.attachments) {
+              if (att.url && att.url.startsWith("data:")) {
+                const matches = att.url.match(/^data:([^;]+);base64,(.+)$/);
+                if (matches) {
+                  parts.push({
+                    inlineData: {
+                      mimeType: matches[1],
+                      data: matches[2]
+                    }
+                  });
+                }
+              }
+            }
+          }
           geminiContents.push({
             role: h.role === "user" ? "user" : "model",
-            parts: [{ text: h.content || "" }]
+            parts: parts
           });
         }
       }
+      
+      const currentParts: any[] = [{ text: userQuery }];
+      if (attachments && Array.isArray(attachments)) {
+        for (const att of attachments) {
+          if (att.url && att.url.startsWith("data:")) {
+            const matches = att.url.match(/^data:([^;]+);base64,(.+)$/);
+            if (matches) {
+              currentParts.push({
+                inlineData: {
+                  mimeType: matches[1],
+                  data: matches[2]
+                }
+              });
+            }
+          }
+        }
+      }
+
       geminiContents.push({
         role: "user",
-        parts: [{ text: userQuery }]
+        parts: currentParts
       });
 
       const consultarShodanDeclaration = {
@@ -1467,8 +1514,7 @@ ${formatted}`;
                 console.log(`[HackerAI] Tool execute: validar_sintaxe_codigo for Language: ${linguagem}`);
                 try {
                   // Ask a fast Gemini Flash helper to analyze the syntax
-                  const syntaxCheckerResponse = await ai.models.generateContent({
-                    model: "gemini-3.5-flash",
+                  const syntaxCheckerResponse = await generateContentWithFallback({
                     contents: `Diga se o seguinte código contém algum erro de sintaxe em ${linguagem || "Python"}. Responda estritamente em JSON com o formato: { "valido": true/false, "erro": "detalhes do erro se houver" }. Código:\n\n${codigo}`,
                     config: {
                       responseMimeType: "application/json"

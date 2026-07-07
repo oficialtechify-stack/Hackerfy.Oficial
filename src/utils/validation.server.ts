@@ -27,7 +27,8 @@ export const AskSchema = z.object({
   language: z.enum(["en", "pt"]).optional().default("en"),
   personality: z.string().max(64).optional(),
   creatorModel: z.string().max(64).optional(),
-  learnings: z.array(z.string()).optional(),
+  learnings: z.array(z.any()).optional(),
+  attachments: z.array(z.any()).optional(),
   userProfile: z
     .object({
       name: z.string().max(100).optional(),
